@@ -86,6 +86,10 @@ TOKENIZER_MAPPING = OrderedDict(
         (CTRLConfig, (CTRLTokenizer, None)),
     ]
 )
+MODEL_TYPE_TOKENIZER_MAPPING = OrderedDict(
+    [(_conf.model_type, TOKENIZER_MAPPING[_conf][0])
+     for _conf in TOKENIZER_MAPPING]
+)
 
 
 class AutoTokenizer:
