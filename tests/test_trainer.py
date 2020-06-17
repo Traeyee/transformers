@@ -11,7 +11,7 @@ if is_torch_available():
         Trainer,
         LineByLineTextDataset,
         AutoModelForSequenceClassification,
-        DefaultDataCollator,
+        default_data_collator,
         DataCollatorForLanguageModeling,
         GlueDataset,
         GlueDataTrainingArguments,
@@ -30,9 +30,9 @@ class DataCollatorIntegrationTest(unittest.TestCase):
         data_args = GlueDataTrainingArguments(
             task_name="mrpc", data_dir="./tests/fixtures/tests_samples/MRPC", overwrite_cache=True
         )
-        dataset = GlueDataset(data_args, tokenizer=tokenizer, evaluate=True)
-        data_collator = DefaultDataCollator()
-        batch = data_collator.collate_batch(dataset.features)
+        dataset = GlueDataset(data_args, tokenizer=tokenizer, mode="dev")
+        data_collator = default_data_collator
+        batch = data_collator(dataset.features)
         self.assertEqual(batch["labels"].dtype, torch.long)
 
     def test_default_regression(self):
@@ -41,9 +41,9 @@ class DataCollatorIntegrationTest(unittest.TestCase):
         data_args = GlueDataTrainingArguments(
             task_name="sts-b", data_dir="./tests/fixtures/tests_samples/STS-B", overwrite_cache=True
         )
-        dataset = GlueDataset(data_args, tokenizer=tokenizer, evaluate=True)
-        data_collator = DefaultDataCollator()
-        batch = data_collator.collate_batch(dataset.features)
+        dataset = GlueDataset(data_args, tokenizer=tokenizer, mode="dev")
+        data_collator = default_data_collator
+        batch = data_collator(dataset.features)
         self.assertEqual(batch["labels"].dtype, torch.float)
 
     def test_lm_tokenizer_without_padding(self):
@@ -55,11 +55,11 @@ class DataCollatorIntegrationTest(unittest.TestCase):
         examples = [dataset[i] for i in range(len(dataset))]
         with self.assertRaises(ValueError):
             # Expect error due to padding token missing on gpt2:
-            data_collator.collate_batch(examples)
+            data_collator(examples)
 
         dataset = TextDataset(tokenizer, file_path=PATH_SAMPLE_TEXT, block_size=512, overwrite_cache=True)
         examples = [dataset[i] for i in range(len(dataset))]
-        batch = data_collator.collate_batch(examples)
+        batch = data_collator(examples)
         self.assertIsInstance(batch, dict)
         self.assertEqual(batch["input_ids"].shape, torch.Size((2, 512)))
         self.assertEqual(batch["labels"].shape, torch.Size((2, 512)))
@@ -71,17 +71,17 @@ class DataCollatorIntegrationTest(unittest.TestCase):
 
         dataset = LineByLineTextDataset(tokenizer, file_path=PATH_SAMPLE_TEXT, block_size=512)
         examples = [dataset[i] for i in range(len(dataset))]
-        batch = data_collator.collate_batch(examples)
+        batch = data_collator(examples)
         self.assertIsInstance(batch, dict)
         self.assertEqual(batch["input_ids"].shape, torch.Size((31, 107)))
-        self.assertEqual(batch["masked_lm_labels"].shape, torch.Size((31, 107)))
+        self.assertEqual(batch["labels"].shape, torch.Size((31, 107)))
 
         dataset = TextDataset(tokenizer, file_path=PATH_SAMPLE_TEXT, block_size=512, overwrite_cache=True)
         examples = [dataset[i] for i in range(len(dataset))]
-        batch = data_collator.collate_batch(examples)
+        batch = data_collator(examples)
         self.assertIsInstance(batch, dict)
         self.assertEqual(batch["input_ids"].shape, torch.Size((2, 512)))
-        self.assertEqual(batch["masked_lm_labels"].shape, torch.Size((2, 512)))
+        self.assertEqual(batch["labels"].shape, torch.Size((2, 512)))
 
 
 @require_torch
@@ -93,7 +93,7 @@ class TrainerIntegrationTest(unittest.TestCase):
         data_args = GlueDataTrainingArguments(
             task_name="mrpc", data_dir="./tests/fixtures/tests_samples/MRPC", overwrite_cache=True
         )
-        eval_dataset = GlueDataset(data_args, tokenizer=tokenizer, evaluate=True)
+        eval_dataset = GlueDataset(data_args, tokenizer=tokenizer, mode="dev")
 
         training_args = TrainingArguments(output_dir="./examples", no_cuda=True)
         trainer = Trainer(model=model, args=training_args, eval_dataset=eval_dataset)
