@@ -82,7 +82,7 @@ def load_and_cache_examples(args,
                             evaluate=False,
                             output_examples=False):
     # Load data features from cache or dataset file
-    input_dir = "TEST_WARN"
+    input_dir = "TEST_SS"
     cached_features_file = os.path.join(
         # input_dir,
         ".",
@@ -448,13 +448,13 @@ def evaluate(args, model, tokenizer, prefix=""):
             loss += np.square(result["pred"].cpu().numpy() -
                               result["label"].cpu().numpy()).mean()
         loss /= TP + FP + FN + TN
-        recall = float(TP) / (TP + FN)
-        precision = float(TP) / (TP + FP)
-        f1 = 2 * recall * precision / (recall + precision)
+        recall = float(TP) / (TP + FN + 1e-8)
+        precision = float(TP) / (TP + FP + 1e-8)
+        f1 = 2 * recall * precision / (recall + precision + 1e-8)
         results["recall_{}".format(threshold)] = recall * 100
         results["precision_{}".format(threshold)] = precision * 100
         results["f1_{}".format(threshold)] = f1 * 100
-        results["loss_{}".format(threshold)] = loss
+        results["loss"] = loss
     return results
 
 

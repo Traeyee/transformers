@@ -18,12 +18,10 @@ class AlbertForSiameseSimilaritySimple(AlbertPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.albert = AlbertModel(config)
-        mlp_size = 1024
-        logger.warning("mlp_size is fixed to 1024")
         self.relu = nn.ReLU()
-        self.layer1 = nn.Linear(config.hidden_size, mlp_size)
-        self.layer2 = nn.Linear(mlp_size, mlp_size)
-        self.layer3 = nn.Linear(mlp_size, config.hidden_size)
+        self.layer1 = nn.Linear(config.hidden_size, config.mlp_size)
+        self.layer2 = nn.Linear(config.mlp_size, config.mlp_size)
+        self.layer3 = nn.Linear(config.mlp_size, config.hidden_size)
 
         self.init_weights()
 
