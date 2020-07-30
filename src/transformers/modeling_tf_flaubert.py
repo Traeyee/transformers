@@ -22,7 +22,7 @@ import tensorflow as tf
 
 from .configuration_flaubert import FlaubertConfig
 from .file_utils import add_start_docstrings
-from .modeling_tf_utils import keras_serializable, shape_list
+from .modeling_tf_utils import cast_bool_to_primitive, keras_serializable, shape_list
 from .modeling_tf_xlm import (
     TFXLMForMultipleChoice,
     TFXLMForQuestionAnsweringSimple,
@@ -30,6 +30,7 @@ from .modeling_tf_xlm import (
     TFXLMForTokenClassification,
     TFXLMMainLayer,
     TFXLMModel,
+    TFXLMPredLayer,
     TFXLMWithLMHeadModel,
     get_masks,
 )
@@ -60,7 +61,7 @@ FLAUBERT_INPUTS_DOCSTRING = r"""
             Indices of input sequence tokens in the vocabulary.
             Indices can be obtained using :class:`transformers.BertTokenizer`.
             See :func:`transformers.PreTrainedTokenizer.encode` and
-            :func:`transformers.PreTrainedTokenizer.encode_plus` for details.
+            :func:`transformers.PreTrainedTokenizer.__call__` for details.
             `What are input IDs? <../glossary.html#input-ids>`__
         attention_mask (:obj:`tf.Tensor` or :obj:`Numpy array` of shape :obj:`(batch_size, sequence_length)`, `optional`, defaults to :obj:`None`):
             Mask to avoid performing attention on padding token indices.
@@ -123,6 +124,8 @@ class TFFlaubertMainLayer(TFXLMMainLayer):
         super().__init__(config, *inputs, **kwargs)
         self.layerdrop = getattr(config, "layerdrop", 0.0)
         self.pre_norm = getattr(config, "pre_norm", False)
+        self.output_attentions = config.output_attentions
+        self.output_hidden_states = config.output_hidden_states
 
     def call(
         self,
@@ -135,8 +138,9 @@ class TFFlaubertMainLayer(TFXLMMainLayer):
         cache=None,
         head_mask=None,
         inputs_embeds=None,
+        output_attentions=None,
+        output_hidden_states=None,
         training=False,
-        output_attentions=False,
     ):
         # removed: src_enc=None, src_len=None
         if isinstance(inputs, (tuple, list)):
@@ -149,7 +153,9 @@ class TFFlaubertMainLayer(TFXLMMainLayer):
             cache = inputs[6] if len(inputs) > 6 else cache
             head_mask = inputs[7] if len(inputs) > 7 else head_mask
             inputs_embeds = inputs[8] if len(inputs) > 8 else inputs_embeds
-            assert len(inputs) <= 9, "Too many inputs."
+            output_attentions = inputs[9] if len(inputs) > 9 else output_attentions
+            output_hidden_states = inputs[10] if len(inputs) > 10 else output_hidden_states
+            assert len(inputs) <= 11, "Too many inputs."
         elif isinstance(inputs, (dict, BatchEncoding)):
             input_ids = inputs.get("input_ids")
             attention_mask = inputs.get("attention_mask", attention_mask)
@@ -160,9 +166,14 @@ class TFFlaubertMainLayer(TFXLMMainLayer):
             cache = inputs.get("cache", cache)
             head_mask = inputs.get("head_mask", head_mask)
             inputs_embeds = inputs.get("inputs_embeds", inputs_embeds)
-            assert len(inputs) <= 9, "Too many inputs."
+            output_attentions = inputs.get("output_attentions", output_attentions)
+            output_hidden_states = inputs.get("output_hidden_states", output_hidden_states)
+            assert len(inputs) <= 11, "Too many inputs."
         else:
             input_ids = inputs
+
+        output_attentions = output_attentions if output_attentions is not None else self.output_attentions
+        output_hidden_states = output_hidden_states if output_hidden_states is not None else self.output_hidden_states
 
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
@@ -251,14 +262,16 @@ class TFFlaubertMainLayer(TFXLMMainLayer):
             if training and (dropout_probability < self.layerdrop):
                 continue
 
-            if self.output_hidden_states:
+            if output_hidden_states:
                 hidden_states = hidden_states + (tensor,)
 
             # self attention
             if not self.pre_norm:
-                attn_outputs = self.attentions[i]([tensor, attn_mask, None, cache, head_mask[i]], training=training)
+                attn_outputs = self.attentions[i](
+                    [tensor, attn_mask, None, cache, head_mask[i], output_attentions], training=training
+                )
                 attn = attn_outputs[0]
-                if output_attentions:
+                if cast_bool_to_primitive(output_attentions, self.output_attentions) is True:
                     attentions = attentions + (attn_outputs[1],)
                 attn = self.dropout(attn, training=training)
                 tensor = tensor + attn
@@ -269,7 +282,7 @@ class TFFlaubertMainLayer(TFXLMMainLayer):
                     [tensor_normalized, attn_mask, None, cache, head_mask[i]], training=training
                 )
                 attn = attn_outputs[0]
-                if output_attentions:
+                if cast_bool_to_primitive(output_attentions, self.output_attentions) is True:
                     attentions = attentions + (attn_outputs[1],)
                 attn = self.dropout(attn, training=training)
                 tensor = tensor + attn
@@ -292,7 +305,7 @@ class TFFlaubertMainLayer(TFXLMMainLayer):
             tensor = tensor * mask[..., tf.newaxis]
 
         # Add last hidden state
-        if self.output_hidden_states:
+        if cast_bool_to_primitive(output_hidden_states, self.output_hidden_states) is True:
             hidden_states = hidden_states + (tensor,)
 
         # update cache length
@@ -303,9 +316,9 @@ class TFFlaubertMainLayer(TFXLMMainLayer):
         # tensor = tensor.transpose(0, 1)
 
         outputs = (tensor,)
-        if self.output_hidden_states:
+        if cast_bool_to_primitive(output_hidden_states, self.output_hidden_states) is True:
             outputs = outputs + (hidden_states,)
-        if output_attentions:
+        if cast_bool_to_primitive(output_attentions, self.output_attentions) is True:
             outputs = outputs + (attentions,)
         return outputs  # outputs, (hidden_states), (attentions)
 
@@ -321,6 +334,7 @@ class TFFlaubertWithLMHeadModel(TFXLMWithLMHeadModel):
     def __init__(self, config, *inputs, **kwargs):
         super().__init__(config, *inputs, **kwargs)
         self.transformer = TFFlaubertMainLayer(config, name="transformer")
+        self.pred_layer = TFXLMPredLayer(config, self.transformer.embeddings, name="pred_layer_._proj")
 
 
 @add_start_docstrings(

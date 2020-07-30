@@ -15,6 +15,7 @@
 
 
 import copy
+import inspect
 import os
 import random
 import tempfile
@@ -22,8 +23,7 @@ import unittest
 from importlib import import_module
 
 from transformers import is_tf_available, is_torch_available
-
-from .utils import _tf_gpu_memory_limit, require_tf
+from transformers.testing_utils import _tf_gpu_memory_limit, require_tf
 
 
 if is_tf_available():
@@ -35,6 +35,12 @@ if is_tf_available():
         TFAdaptiveEmbedding,
         TFSharedEmbeddings,
         TF_MODEL_FOR_MULTIPLE_CHOICE_MAPPING,
+        TF_MODEL_FOR_QUESTION_ANSWERING_MAPPING,
+        TF_MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING,
+        TF_MODEL_FOR_TOKEN_CLASSIFICATION_MAPPING,
+        TF_MODEL_FOR_CAUSAL_LM_MAPPING,
+        TF_MODEL_FOR_MASKED_LM_MAPPING,
+        TF_MODEL_FOR_SEQ_TO_SEQ_CAUSAL_LM_MAPPING,
     )
 
     if _tf_gpu_memory_limit is not None:
@@ -71,14 +77,31 @@ class TFModelTesterMixin:
     test_resize_embeddings = True
     is_encoder_decoder = False
 
-    def _prepare_for_class(self, inputs_dict, model_class):
+    def _prepare_for_class(self, inputs_dict, model_class, return_labels=False):
         if model_class in TF_MODEL_FOR_MULTIPLE_CHOICE_MAPPING.values():
-            return {
-                k: tf.tile(tf.expand_dims(v, 1), (1, self.model_tester.num_choices, 1))
-                if isinstance(v, tf.Tensor) and v.ndim != 0
+            inputs_dict = {
+                k: tf.tile(tf.expand_dims(v, 1), (1, self.model_tester.num_choices) + (1,) * (v.ndim - 1))
+                if isinstance(v, tf.Tensor) and v.ndim > 0
                 else v
                 for k, v in inputs_dict.items()
             }
+
+        if return_labels:
+            if model_class in TF_MODEL_FOR_MULTIPLE_CHOICE_MAPPING.values():
+                inputs_dict["labels"] = tf.ones(self.model_tester.batch_size)
+            elif model_class in TF_MODEL_FOR_QUESTION_ANSWERING_MAPPING.values():
+                inputs_dict["start_positions"] = tf.zeros(self.model_tester.batch_size)
+                inputs_dict["end_positions"] = tf.zeros(self.model_tester.batch_size)
+            elif model_class in TF_MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING.values():
+                inputs_dict["labels"] = tf.zeros(self.model_tester.batch_size)
+            elif model_class in TF_MODEL_FOR_TOKEN_CLASSIFICATION_MAPPING.values():
+                inputs_dict["labels"] = tf.zeros((self.model_tester.batch_size, self.model_tester.seq_length))
+            elif model_class in TF_MODEL_FOR_CAUSAL_LM_MAPPING.values():
+                inputs_dict["labels"] = tf.zeros((self.model_tester.batch_size, self.model_tester.seq_length))
+            elif model_class in TF_MODEL_FOR_MASKED_LM_MAPPING.values():
+                inputs_dict["labels"] = tf.zeros((self.model_tester.batch_size, self.model_tester.seq_length))
+            elif model_class in TF_MODEL_FOR_SEQ_TO_SEQ_CAUSAL_LM_MAPPING.values():
+                inputs_dict["labels"] = tf.zeros((self.model_tester.batch_size, self.model_tester.seq_length))
         return inputs_dict
 
     def test_initialization(self):
@@ -126,6 +149,7 @@ class TFModelTesterMixin:
             if "T5" in main_layer_class.__name__:
                 # Take the same values than in TFT5ModelTester for this shared layer
                 shared = TFSharedEmbeddings(99, 32, name="shared")
+                config.use_cache = False
                 main_layer = main_layer_class(config, embed_tokens=shared)
             else:
                 main_layer = main_layer_class(config)
@@ -276,7 +300,7 @@ class TFModelTesterMixin:
                     "decoder_input_ids": tf.keras.Input(
                         batch_shape=(2, 2000), name="decoder_input_ids", dtype="int32"
                     ),
-                    "inputs": tf.keras.Input(batch_shape=(2, 2000), name="inputs", dtype="int32"),
+                    "input_ids": tf.keras.Input(batch_shape=(2, 2000), name="input_ids", dtype="int32"),
                 }
             elif model_class in TF_MODEL_FOR_MULTIPLE_CHOICE_MAPPING.values():
                 input_ids = tf.keras.Input(batch_shape=(4, 2, 2000), name="input_ids", dtype="int32")
@@ -295,7 +319,7 @@ class TFModelTesterMixin:
             outputs_dict = model(input_ids)
             hidden_states = outputs_dict[0]
 
-            # Add a dense layer on top to test intetgration with other keras modules
+            # Add a dense layer on top to test integration with other keras modules
             outputs = tf.keras.layers.Dense(2, activation="softmax", name="outputs")(hidden_states)
 
             # Compile extended model
@@ -310,7 +334,7 @@ class TFModelTesterMixin:
             outputs_dict = model(self._prepare_for_class(inputs_dict, model_class))
 
             inputs_keywords = copy.deepcopy(self._prepare_for_class(inputs_dict, model_class))
-            input_ids = inputs_keywords.pop("input_ids" if not self.is_encoder_decoder else "inputs", None,)
+            input_ids = inputs_keywords.pop("input_ids", None)
             outputs_keywords = model(input_ids, **inputs_keywords)
             output_dict = outputs_dict[0].numpy()
             output_keywords = outputs_keywords[0].numpy()
@@ -392,16 +416,22 @@ class TFModelTesterMixin:
     def test_hidden_states_output(self):
         config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
 
-        for model_class in self.all_model_classes:
-            config.output_hidden_states = True
+        def check_hidden_states_output(config, inputs_dict, model_class):
             model = model_class(config)
             outputs = model(self._prepare_for_class(inputs_dict, model_class))
             hidden_states = [t.numpy() for t in outputs[-1]]
-            self.assertEqual(model.config.output_hidden_states, True)
             self.assertEqual(len(hidden_states), self.model_tester.num_hidden_layers + 1)
             self.assertListEqual(
                 list(hidden_states[0].shape[-2:]), [self.model_tester.seq_length, self.model_tester.hidden_size],
             )
+
+        for model_class in self.all_model_classes:
+            inputs_dict["output_hidden_states"] = True
+            check_hidden_states_output(config, inputs_dict, model_class)
+
+            del inputs_dict["output_hidden_states"]
+            config.output_hidden_states = True
+            check_hidden_states_output(config, inputs_dict, model_class)
 
     def test_model_common_attributes(self):
         config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
@@ -458,9 +488,9 @@ class TFModelTesterMixin:
                 input_ids = inputs["input_ids"]
                 del inputs["input_ids"]
             else:
-                encoder_input_ids = inputs["inputs"]
+                encoder_input_ids = inputs["input_ids"]
                 decoder_input_ids = inputs.get("decoder_input_ids", encoder_input_ids)
-                del inputs["inputs"]
+                del inputs["input_ids"]
                 inputs.pop("decoder_input_ids", None)
 
             wte = model.get_input_embeddings()
@@ -471,6 +501,30 @@ class TFModelTesterMixin:
                 inputs["decoder_inputs_embeds"] = self._get_embeds(wte, decoder_input_ids)
 
             model(inputs)
+
+    def test_resize_token_embeddings(self):
+        if not self.test_resize_embeddings:
+            return
+        config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
+        INPUT_SHAPE = [1, 10, config.hidden_size]
+        for model_class in self.all_model_classes:
+            for size in [config.vocab_size - 10, config.vocab_size + 10, None]:
+                # build the embeddings
+                model = model_class(config=config)
+                emb_old = model.get_input_embeddings()
+                emb_old.build(INPUT_SHAPE)
+                # reshape the embeddings
+                new_embeddings = model._get_resized_embeddings(emb_old, size)
+                # # check that the the resized embeddings size matches the desired size.
+                assert_size = size if size is not None else config.vocab_size
+                self.assertEqual(new_embeddings.shape[0], assert_size)
+                # check that weights remain the same after resizing
+                emd_old_weights = model._get_word_embeddings(emb_old)
+                models_equal = True
+                for p1, p2 in zip(emd_old_weights.numpy(), new_embeddings.numpy()):
+                    if np.sum(abs(p1 - p2)) > 0:
+                        models_equal = False
+                self.assertTrue(models_equal)
 
     def test_lm_head_model_random_no_beam_search_generate(self):
         config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
@@ -540,6 +594,57 @@ class TFModelTesterMixin:
             # only count generated tokens
             generated_ids = output_tokens[:, input_ids.shape[-1] :]
             self.assertFalse(self._check_match_tokens(generated_ids.numpy().tolist(), bad_words_ids))
+
+    def test_loss_computation(self):
+        config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
+        for model_class in self.all_model_classes:
+            model = model_class(config)
+            if getattr(model, "compute_loss", None):
+                # The number of elements in the loss should be the same as the number of elements in the label
+                prepared_for_class = self._prepare_for_class(inputs_dict.copy(), model_class, return_labels=True)
+                added_label = prepared_for_class[list(prepared_for_class.keys() - inputs_dict.keys())[0]]
+                loss_size = tf.size(added_label)
+
+                if model.__class__ in TF_MODEL_FOR_CAUSAL_LM_MAPPING.values():
+                    # if loss is causal lm loss, labels are shift, so that one label per batch
+                    # is cut
+                    loss_size = loss_size - self.model_tester.batch_size
+
+                # Test that model correctly compute the loss with kwargs
+                prepared_for_class = self._prepare_for_class(inputs_dict.copy(), model_class, return_labels=True)
+                input_ids = prepared_for_class.pop("input_ids")
+
+                loss = model(input_ids, **prepared_for_class)[0]
+                self.assertEqual(loss.shape, [loss_size])
+
+                # Test that model correctly compute the loss with a dict
+                prepared_for_class = self._prepare_for_class(inputs_dict.copy(), model_class, return_labels=True)
+                loss = model(prepared_for_class)[0]
+                self.assertEqual(loss.shape, [loss_size])
+
+                # Test that model correctly compute the loss with a tuple
+                prepared_for_class = self._prepare_for_class(inputs_dict.copy(), model_class, return_labels=True)
+
+                # Get keys that were added with the _prepare_for_class function
+                label_keys = prepared_for_class.keys() - inputs_dict.keys()
+                signature = inspect.getfullargspec(model.call)[0]
+
+                # Create a dictionary holding the location of the tensors in the tuple
+                tuple_index_mapping = {1: "input_ids"}
+                for label_key in label_keys:
+                    label_key_index = signature.index(label_key)
+                    tuple_index_mapping[label_key_index] = label_key
+                sorted_tuple_index_mapping = sorted(tuple_index_mapping.items())
+
+                # Initialize a list with None, update the values and convert to a tuple
+                list_input = [None] * sorted_tuple_index_mapping[-1][0]
+                for index, value in sorted_tuple_index_mapping:
+                    list_input[index - 1] = prepared_for_class[value]
+                tuple_input = tuple(list_input)
+
+                # Send to model
+                loss = model(tuple_input)[0]
+                self.assertEqual(loss.shape, [loss_size])
 
     def _generate_random_bad_tokens(self, num_bad_tokens, model):
         # special tokens cannot be bad tokens

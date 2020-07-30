@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import copy
-import logging
 import os.path
 import random
 import tempfile
@@ -22,8 +21,7 @@ import unittest
 from typing import List
 
 from transformers import is_torch_available
-
-from .utils import require_multigpu, require_torch, slow, torch_device
+from transformers.testing_utils import require_multigpu, require_torch, slow, torch_device
 
 
 if is_torch_available():
@@ -68,7 +66,7 @@ class ModelTesterMixin:
         if model_class in MODEL_FOR_MULTIPLE_CHOICE_MAPPING.values():
             return {
                 k: v.unsqueeze(1).expand(-1, self.model_tester.num_choices, -1).contiguous()
-                if isinstance(v, torch.Tensor) and v.ndim != 0
+                if isinstance(v, torch.Tensor) and v.ndim > 1
                 else v
                 for k, v in inputs_dict.items()
             }
@@ -143,14 +141,13 @@ class ModelTesterMixin:
 
         for model_class in self.all_model_classes:
             inputs_dict["output_attentions"] = True
-            config.output_hidden_states = False
+            inputs_dict["output_hidden_states"] = False
             model = model_class(config)
             model.to(torch_device)
             model.eval()
             with torch.no_grad():
                 outputs = model(**self._prepare_for_class(inputs_dict, model_class))
             attentions = outputs[-1]
-            self.assertEqual(model.config.output_hidden_states, False)
             self.assertEqual(len(attentions), self.model_tester.num_hidden_layers)
 
             # check that output_attentions also work using config
@@ -162,7 +159,6 @@ class ModelTesterMixin:
             with torch.no_grad():
                 outputs = model(**self._prepare_for_class(inputs_dict, model_class))
             attentions = outputs[-1]
-            self.assertEqual(model.config.output_hidden_states, False)
             self.assertEqual(len(attentions), self.model_tester.num_hidden_layers)
 
             if chunk_length is not None:
@@ -201,14 +197,13 @@ class ModelTesterMixin:
 
             # Check attention is always last and order is fine
             inputs_dict["output_attentions"] = True
-            config.output_hidden_states = True
+            inputs_dict["output_hidden_states"] = True
             model = model_class(config)
             model.to(torch_device)
             model.eval()
             with torch.no_grad():
                 outputs = model(**self._prepare_for_class(inputs_dict, model_class))
             self.assertEqual(out_len + (2 if self.is_encoder_decoder else 1), len(outputs))
-            self.assertEqual(model.config.output_hidden_states, True)
 
             self_attentions = outputs[-1]
             self.assertEqual(len(self_attentions), self.model_tester.num_hidden_layers)
@@ -225,7 +220,6 @@ class ModelTesterMixin:
 
     def test_torchscript(self):
         config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
-
         self._create_and_check_torchscript(config, inputs_dict)
 
     def test_torchscript_output_attentions(self):
@@ -235,7 +229,6 @@ class ModelTesterMixin:
 
     def test_torchscript_output_hidden_state(self):
         config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
-
         config.output_hidden_states = True
         self._create_and_check_torchscript(config, inputs_dict)
 
@@ -493,19 +486,16 @@ class ModelTesterMixin:
             self.assertDictEqual(model.config.pruned_heads, {0: [0], 1: [1, 2], 2: [1, 2]})
 
     def test_hidden_states_output(self):
-        config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
-
-        for model_class in self.all_model_classes:
-            config.output_hidden_states = True
+        def check_hidden_states_output(inputs_dict, config, model_class):
             model = model_class(config)
             model.to(torch_device)
             model.eval()
+
             with torch.no_grad():
                 outputs = model(**self._prepare_for_class(inputs_dict, model_class))
             hidden_states = outputs[-1]
-            self.assertEqual(model.config.output_hidden_states, True)
-            self.assertEqual(len(hidden_states), self.model_tester.num_hidden_layers + 1)
 
+            self.assertEqual(len(hidden_states), self.model_tester.num_hidden_layers + 1)
             if hasattr(self.model_tester, "encoder_seq_length"):
                 seq_length = self.model_tester.encoder_seq_length
                 if hasattr(self.model_tester, "chunk_length") and self.model_tester.chunk_length > 1:
@@ -516,6 +506,18 @@ class ModelTesterMixin:
             self.assertListEqual(
                 list(hidden_states[0].shape[-2:]), [seq_length, self.model_tester.hidden_size],
             )
+
+        config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
+
+        for model_class in self.all_model_classes:
+            inputs_dict["output_hidden_states"] = True
+            check_hidden_states_output(inputs_dict, config, model_class)
+
+            # check that output_hidden_states also work using config
+            del inputs_dict["output_hidden_states"]
+            config.output_hidden_states = True
+
+            check_hidden_states_output(inputs_dict, config, model_class)
 
     def test_resize_tokens_embeddings(self):
         (original_config, inputs_dict,) = self.model_tester.prepare_config_and_inputs_for_common()
@@ -608,15 +610,11 @@ class ModelTesterMixin:
             if model_not_tied.get_output_embeddings() is None:
                 continue
 
-            params_not_tied = list(model_not_tied.parameters())
-
             config_tied = copy.deepcopy(config)
             config_tied.torchscript = False
             model_tied = model_class(config_tied)
             params_tied = list(model_tied.parameters())
-
             # Check that the embedding layer and decoding layer are the same in size and in value
-            self.assertGreater(len(params_not_tied), len(params_tied))
             # self.assertTrue(check_same_values(embeddings, decoding))
 
             # # Check that after modification, they remain the same.
@@ -634,7 +632,6 @@ class ModelTesterMixin:
             # Check that after resize they remain tied.
             model_tied.resize_token_embeddings(config.vocab_size + 10)
             params_tied_2 = list(model_tied.parameters())
-            self.assertGreater(len(params_not_tied), len(params_tied))
             self.assertEqual(len(params_tied_2), len(params_tied))
 
             # decoding.weight.data.mul_(20)
@@ -806,8 +803,10 @@ class ModelTesterMixin:
 
             # Wrap model in nn.DataParallel
             model = torch.nn.DataParallel(model)
+            # Our model outputs do not work with DataParallel, so forcing return tuple.
+            inputs_dict["return_tuple"] = True
             with torch.no_grad():
-                _ = model(**inputs_dict)
+                _ = model(**self._prepare_for_class(inputs_dict, model_class))
 
 
 global_rng = random.Random()
@@ -849,7 +848,6 @@ def floats_tensor(shape, scale=1.0, rng=None, name=None):
 class ModelUtilsTest(unittest.TestCase):
     @slow
     def test_model_from_pretrained(self):
-        logging.basicConfig(level=logging.INFO)
         for model_name in BERT_PRETRAINED_MODEL_ARCHIVE_LIST[:1]:
             config = BertConfig.from_pretrained(model_name)
             self.assertIsNotNone(config)

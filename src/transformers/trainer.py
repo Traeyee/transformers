@@ -1,12 +1,12 @@
 import logging
 import math
 import os
-import random
 import re
 import shutil
+import warnings
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -19,22 +19,22 @@ from torch.utils.data.sampler import RandomSampler, Sampler, SequentialSampler
 from tqdm.auto import tqdm, trange
 
 from .data.data_collator import DataCollator, default_data_collator
+from .file_utils import is_apex_available, is_torch_tpu_available
 from .modeling_utils import PreTrainedModel
 from .optimization import AdamW, get_linear_schedule_with_warmup
-from .trainer_utils import PREFIX_CHECKPOINT_DIR, EvalPrediction, PredictionOutput, TrainOutput, is_wandb_available
-from .training_args import TrainingArguments, is_torch_tpu_available
+from .trainer_utils import (
+    PREFIX_CHECKPOINT_DIR,
+    EvalPrediction,
+    PredictionOutput,
+    TrainOutput,
+    is_wandb_available,
+    set_seed,
+)
+from .training_args import TrainingArguments
 
 
-try:
+if is_apex_available():
     from apex import amp
-
-    _has_apex = True
-except ImportError:
-    _has_apex = False
-
-
-def is_apex_available():
-    return _has_apex
 
 
 if is_torch_tpu_available():
@@ -66,18 +66,13 @@ if is_wandb_available():
 logger = logging.getLogger(__name__)
 
 
-def set_seed(seed: int):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    # ^^ safe to call this function even if cuda is not available
-
-
 @contextmanager
 def torch_distributed_zero_first(local_rank: int):
     """
     Decorator to make all processes in distributed training wait for each local_master to do something.
+
+    Args:
+        local_rank (:obj:`int`): The rank of the local process.
     """
     if local_rank not in [-1, 0]:
         torch.distributed.barrier()
@@ -139,7 +134,31 @@ def get_tpu_sampler(dataset: Dataset):
 class Trainer:
     """
     Trainer is a simple but feature-complete training and eval loop for PyTorch,
-    optimized for Transformers.
+    optimized for 🤗 Transformers.
+
+    Args:
+        model (:class:`~transformers.PreTrainedModel`):
+            The model to train, evaluate or use for predictions.
+        args (:class:`~transformers.TrainingArguments`):
+            The arguments to tweak training.
+        data_collator (:obj:`DataCollator`, `optional`, defaults to :func:`~transformers.default_data_collator`):
+            The function to use to from a batch from a list of elements of :obj:`train_dataset` or
+            :obj:`eval_dataset`.
+        train_dataset (:obj:`torch.utils.data.dataset.Dataset`, `optional`):
+            The dataset to use for training.
+        eval_dataset (:obj:`torch.utils.data.dataset.Dataset`, `optional`):
+            The dataset to use for evaluation.
+        compute_metrics (:obj:`Callable[[EvalPrediction], Dict]`, `optional`):
+            The function that will be used to compute metrics at evaluation. Must take a
+            :class:`~transformers.EvalPrediction` and return a dictionary string to metric values.
+        prediction_loss_only (:obj:`bool`, `optional`, defaults to `False`):
+            When performing evaluation and predictions, only returns the loss.
+        tb_writer (:obj:`SummaryWriter`, `optional`):
+            Object to write to TensorBoard.
+        optimizers (:obj:`Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR`, `optional`):
+            A tuple containing the optimizer and the scheduler to use. Will default to an instance of
+            :class:`~transformers.AdamW` on your model and a scheduler given by
+            :func:`~transformers.get_linear_schedule_with_warmup` controlled by :obj:`args`.
     """
 
     model: PreTrainedModel
@@ -166,14 +185,6 @@ class Trainer:
         tb_writer: Optional["SummaryWriter"] = None,
         optimizers: Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = None,
     ):
-        """
-        Trainer is a simple but feature-complete training and eval loop for PyTorch,
-        optimized for Transformers.
-
-        Args:
-            prediction_loss_only:
-                (Optional) in evaluation and prediction, only return the loss
-        """
         self.model = model.to(args.device)
         self.args = args
         self.data_collator = data_collator if data_collator is not None else default_data_collator
@@ -191,8 +202,8 @@ class Trainer:
                 "You are instantiating a Trainer but Tensorboard is not installed. You should consider installing it."
             )
         if is_wandb_available():
-            self._setup_wandb()
-        else:
+            self.setup_wandb()
+        elif os.environ.get("WANDB_DISABLED") != "true":
             logger.info(
                 "You are instantiating a Trainer but W&B is not installed. To use wandb logging, "
                 "run `pip install wandb; wandb login` see https://docs.wandb.com/huggingface."
@@ -205,20 +216,42 @@ class Trainer:
             # Set an xla_device flag on the model's config.
             # We'll find a more elegant and not need to do this in the future.
             self.model.config.xla_device = True
+        if not callable(self.data_collator) and callable(getattr(self.data_collator, "collate_batch", None)):
+            self.data_collator = self.data_collator.collate_batch
+            warnings.warn(
+                (
+                    "The `data_collator` should now be a simple callable (function, class with `__call__`), classes "
+                    + "with a `collate_batch` are deprecated and won't be supported in a future version."
+                ),
+                FutureWarning,
+            )
 
-    def get_train_dataloader(self) -> DataLoader:
-        if self.train_dataset is None:
-            raise ValueError("Trainer: training requires a train_dataset.")
-        if is_torch_tpu_available():
-            train_sampler = get_tpu_sampler(self.train_dataset)
+    def _get_train_sampler(self) -> Optional[torch.utils.data.sampler.Sampler]:
+        if isinstance(self.train_dataset, torch.utils.data.IterableDataset):
+            return None
+        elif is_torch_tpu_available():
+            return get_tpu_sampler(self.train_dataset)
         else:
-            train_sampler = (
+            return (
                 RandomSampler(self.train_dataset)
                 if self.args.local_rank == -1
                 else DistributedSampler(self.train_dataset)
             )
 
-        data_loader = DataLoader(
+    def get_train_dataloader(self) -> DataLoader:
+        """
+        Returns the training :class:`~torch.utils.data.DataLoader`.
+
+        Will use no sampler if :obj:`self.train_dataset` is a :obj:`torch.utils.data.IterableDataset`, a random sampler
+        (adapted to distributed training if necessary) otherwise.
+
+        Subclass and override this method if you want to inject some custom behavior.
+        """
+        if self.train_dataset is None:
+            raise ValueError("Trainer: training requires a train_dataset.")
+        train_sampler = self._get_train_sampler()
+
+        return DataLoader(
             self.train_dataset,
             batch_size=self.args.train_batch_size,
             sampler=train_sampler,
@@ -226,53 +259,66 @@ class Trainer:
             drop_last=self.args.dataloader_drop_last,
         )
 
-        return data_loader
+    def _get_eval_sampler(self, eval_dataset: Dataset) -> Optional[torch.utils.data.sampler.Sampler]:
+        if isinstance(eval_dataset, torch.utils.data.IterableDataset):
+            return None
+        elif is_torch_tpu_available():
+            return SequentialDistributedSampler(eval_dataset, num_replicas=xm.xrt_world_size(), rank=xm.get_ordinal())
+        elif self.args.local_rank != -1:
+            return SequentialDistributedSampler(eval_dataset)
+        else:
+            return SequentialSampler(eval_dataset)
 
     def get_eval_dataloader(self, eval_dataset: Optional[Dataset] = None) -> DataLoader:
+        """
+        Returns the evaluation :class:`~torch.utils.data.DataLoader`.
+
+        Will use no sampler if :obj:`self.eval_dataset` is a :obj:`torch.utils.data.IterableDataset`, a sequential
+        sampler (adapted to distributed training if necessary) otherwise.
+
+        Subclass and override this method if you want to inject some custom behavior.
+
+        Args:
+            eval_dataset (:obj:`torch.utils.data.dataset.Dataset`, `optional`):
+                If provided, will override :obj:`self.eval_dataset`.
+        """
         if eval_dataset is None and self.eval_dataset is None:
             raise ValueError("Trainer: evaluation requires an eval_dataset.")
 
         eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
+        eval_sampler = self._get_eval_sampler(eval_dataset)
 
-        if is_torch_tpu_available():
-            sampler = SequentialDistributedSampler(
-                eval_dataset, num_replicas=xm.xrt_world_size(), rank=xm.get_ordinal()
-            )
-        elif self.args.local_rank != -1:
-            sampler = SequentialDistributedSampler(eval_dataset)
-        else:
-            sampler = SequentialSampler(eval_dataset)
-
-        data_loader = DataLoader(
+        return DataLoader(
             eval_dataset,
-            sampler=sampler,
+            sampler=eval_sampler,
             batch_size=self.args.eval_batch_size,
             collate_fn=self.data_collator,
             drop_last=self.args.dataloader_drop_last,
         )
-
-        return data_loader
 
     def get_test_dataloader(self, test_dataset: Dataset) -> DataLoader:
-        # We use the same batch_size as for eval.
-        if is_torch_tpu_available():
-            sampler = SequentialDistributedSampler(
-                test_dataset, num_replicas=xm.xrt_world_size(), rank=xm.get_ordinal()
-            )
-        elif self.args.local_rank != -1:
-            sampler = SequentialDistributedSampler(test_dataset)
-        else:
-            sampler = SequentialSampler(test_dataset)
+        """
+        Returns the test :class:`~torch.utils.data.DataLoader`.
 
-        data_loader = DataLoader(
+        Will use no sampler if :obj:`test_dataset` is a :obj:`torch.utils.data.IterableDataset`, a sequential
+        sampler (adapted to distributed training if necessary) otherwise.
+
+        Subclass and override this method if you want to inject some custom behavior.
+
+        Args:
+            eval_dataset (:obj:`torch.utils.data.dataset.Dataset`, `optional`):
+                The test dataset to use.
+        """
+        test_sampler = self._get_eval_sampler(test_dataset)
+
+        # We use the same batch_size as for eval.
+        return DataLoader(
             test_dataset,
-            sampler=sampler,
+            sampler=test_sampler,
             batch_size=self.args.eval_batch_size,
             collate_fn=self.data_collator,
             drop_last=self.args.dataloader_drop_last,
         )
-
-        return data_loader
 
     def get_optimizers(
         self, num_training_steps: int
@@ -280,9 +326,8 @@ class Trainer:
         """
         Setup the optimizer and the learning rate scheduler.
 
-        We provide a reasonable default that works well.
-        If you want to use something else, you can pass a tuple in the Trainer's init,
-        or override this method in a subclass.
+        We provide a reasonable default that works well. If you want to use something else, you can pass a tuple in the
+        Trainer's init through :obj:`optimizers`, or subclass and override this method in a subclass.
         """
         if self.optimizers is not None:
             return self.optimizers
@@ -298,18 +343,23 @@ class Trainer:
                 "weight_decay": 0.0,
             },
         ]
-        optimizer = AdamW(optimizer_grouped_parameters, lr=self.args.learning_rate, eps=self.args.adam_epsilon)
+        optimizer = AdamW(
+            optimizer_grouped_parameters,
+            lr=self.args.learning_rate,
+            betas=(self.args.adam_beta1, self.args.adam_beta2),
+            eps=self.args.adam_epsilon,
+        )
         scheduler = get_linear_schedule_with_warmup(
             optimizer, num_warmup_steps=self.args.warmup_steps, num_training_steps=num_training_steps
         )
         return optimizer, scheduler
 
-    def _setup_wandb(self):
+    def setup_wandb(self):
         """
         Setup the optional Weights & Biases (`wandb`) integration.
 
-        One can override this method to customize the setup if needed.  Find more information at https://docs.wandb.com/huggingface
-        You can also override the following environment variables:
+        One can subclass and override this method to customize the setup if needed. Find more information
+        `here <https://docs.wandb.com/huggingface>`__. You can also override the following environment variables:
 
         Environment:
             WANDB_WATCH:
@@ -320,20 +370,27 @@ class Trainer:
             WANDB_DISABLED:
                 (Optional): boolean - defaults to false, set to "true" to disable wandb entirely
         """
+        if hasattr(self, "_setup_wandb"):
+            warnings.warn(
+                "The `_setup_wandb` method is deprecated and won't be called in a future version, define `setup_wandb` in your subclass.",
+                FutureWarning,
+            )
+            return self._setup_wandb()
+
         if self.is_world_master():
             logger.info(
                 'Automatic Weights & Biases logging enabled, to disable set os.environ["WANDB_DISABLED"] = "true"'
             )
             wandb.init(project=os.getenv("WANDB_PROJECT", "huggingface"), config=vars(self.args))
-            # keep track of model topology and gradients
-            if os.getenv("WANDB_WATCH") != "false":
+            # keep track of model topology and gradients, unsupported on TPU
+            if not is_torch_tpu_available() and os.getenv("WANDB_WATCH") != "false":
                 wandb.watch(
                     self.model, log=os.getenv("WANDB_WATCH", "gradients"), log_freq=max(100, self.args.logging_steps)
                 )
 
     def num_examples(self, dataloader: DataLoader) -> int:
         """
-        Helper to get num of examples from a DataLoader, by accessing its Dataset.
+        Helper to get number of samples in a :class:`~torch.utils.data.DataLoader` by accessing its dataset.
         """
         return len(dataloader.dataset)
 
@@ -342,9 +399,9 @@ class Trainer:
         Main training entry point.
 
         Args:
-            model_path:
-                (Optional) Local path to model if model to train has been instantiated from a local path
-                If present, we will try reloading the optimizer/scheduler states from there.
+            model_path (:obj:`str`, `optional`):
+                Local path to the model if the model to train has been instantiated from a local path. If present,
+                training will resume from the optimizer/scheduler states loaded here.
         """
         train_dataloader = self.get_train_dataloader()
         if self.args.max_steps > 0:
@@ -450,6 +507,10 @@ class Trainer:
             else:
                 epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=not self.is_local_master())
 
+            # Reset the past mems state at the beginning of each epoch if necessary.
+            if self.args.past_index >= 0:
+                self._past = None
+
             for step, inputs in enumerate(epoch_iterator):
 
                 # Skip past any already trained steps if resuming training
@@ -457,7 +518,7 @@ class Trainer:
                     steps_trained_in_current_epoch -= 1
                     continue
 
-                tr_loss += self._training_step(model, inputs, optimizer)
+                tr_loss += self.training_step(model, inputs, optimizer)
 
                 if (step + 1) % self.args.gradient_accumulation_steps == 0 or (
                     # last step in epoch but step is always smaller than gradient_accumulation_steps
@@ -492,10 +553,10 @@ class Trainer:
                         )
                         logging_loss = tr_loss
 
-                        self._log(logs)
+                        self.log(logs)
 
-                        if self.args.evaluate_during_training:
-                            self.evaluate()
+                    if self.args.evaluate_during_training and self.global_step % self.args.eval_steps == 0:
+                        self.evaluate()
 
                     if self.args.save_steps > 0 and self.global_step % self.args.save_steps == 0:
                         # In all cases (even distributed/parallel), self.model is always a reference
@@ -526,17 +587,38 @@ class Trainer:
             if self.args.max_steps > 0 and self.global_step > self.args.max_steps:
                 train_iterator.close()
                 break
-            if self.args.tpu_metrics_debug:
+            if self.args.tpu_metrics_debug or self.args.debug:
                 # tpu-comment: Logging debug metrics for PyTorch/XLA (compile, execute times, ops, etc.)
                 xm.master_print(met.metrics_report())
 
         if self.tb_writer:
             self.tb_writer.close()
+        if self.args.past_index and hasattr(self, "_past"):
+            # Clean the state at the end of training
+            delattr(self, "_past")
 
         logger.info("\n\nTraining completed. Do not forget to share your model on huggingface.co/models =)\n\n")
         return TrainOutput(self.global_step, tr_loss / self.global_step)
 
-    def _log(self, logs: Dict[str, float], iterator: Optional[tqdm] = None) -> None:
+    def log(self, logs: Dict[str, float], iterator: Optional[tqdm] = None) -> None:
+        """
+        Log :obj:`logs` on the various objects watching training.
+
+        Subclass and override this method to inject custom behavior.
+
+        Args:
+            logs (:obj:`Dict[str, float]`):
+                The values to log.
+            iterator (:obj:`tqdm`, `optional`):
+                A potential tqdm progress bar to write the logs on.
+        """
+        if hasattr(self, "_log"):
+            warnings.warn(
+                "The `_log` method is deprecated and won't be called in a future version, define `log` in your subclass.",
+                FutureWarning,
+            )
+            return self._log(logs, iterator=iterator)
+
         if self.epoch is not None:
             logs["epoch"] = self.epoch
         if self.global_step is None:
@@ -564,17 +646,65 @@ class Trainer:
         if iterator is not None:
             iterator.write(output)
         else:
-            logger.info(output)
+            print(output)
 
-    def _training_step(
-        self, model: nn.Module, inputs: Dict[str, torch.Tensor], optimizer: torch.optim.Optimizer
-    ) -> float:
-        model.train()
+    def _prepare_inputs(
+        self, inputs: Dict[str, Union[torch.Tensor, Any]], model: nn.Module
+    ) -> Dict[str, Union[torch.Tensor, Any]]:
+        """
+        Prepare :obj:`inputs` before feeding them to the model, converting them to tensors if they are not already and
+        handling potential state.
+        """
         for k, v in inputs.items():
-            inputs[k] = v.to(self.args.device)
+            if isinstance(v, torch.Tensor):
+                inputs[k] = v.to(self.args.device)
+
+        if self.args.past_index >= 0 and self._past is not None:
+            inputs["mems"] = self._past
+        # Our model outputs do not work with DataParallel, so forcing return tuple.
+        if isinstance(model, nn.DataParallel):
+            inputs["return_tuple"] = True
+        return inputs
+
+    def training_step(
+        self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]], optimizer: torch.optim.Optimizer
+    ) -> float:
+        """
+        Perform a training step on :obj:`model` using obj:`inputs` and :obj:`optimizer`.
+
+        Subclass and override to inject custom behavior.
+
+        Args:
+            model (:obj:`nn.Module`):
+                The model to train.
+            inputs (:obj:`Dict[str, Union[torch.Tensor, Any]]`):
+                The inputs and targets of the model.
+
+                The dictionary will be unpacked before being fed to the model. Most models expect the targets under the
+                argument :obj:`labels`. Check your model's documentation for all accepted arguments.
+            optimizer (:obj:`torch.optim.Optimizer`):
+                The optimizer to use to make a step.
+
+        Return:
+            `float`:
+            The training loss on this batch.
+        """
+        if hasattr(self, "_training_step"):
+            warnings.warn(
+                "The `_training_step` method is deprecated and won't be called in a future version, define `training_step` in your subclass.",
+                FutureWarning,
+            )
+            return self._training_step(model, inputs, optimizer)
+
+        model.train()
+        inputs = self._prepare_inputs(inputs, model)
 
         outputs = model(**inputs)
-        loss = outputs[0]  # model outputs are always tuple in transformers (see doc)
+        # We don't use .loss here since the model may return tuples instead of ModelOutput.
+        loss = outputs[0]
+
+        if self.args.past_index >= 0:
+            self._past = outputs[self.args.past_index]
 
         if self.args.n_gpu > 1:
             loss = loss.mean()  # mean() to average on multi-gpu parallel training
@@ -607,8 +737,7 @@ class Trainer:
 
     def save_model(self, output_dir: Optional[str] = None):
         """
-        Saving best-practices: if you use default names for the model,
-        you can reload it using from_pretrained().
+        Will save the model, so you can reload it using :obj:`from_pretrained()`.
 
         Will only save from the world_master process (unless in TPUs).
         """
@@ -679,30 +808,28 @@ class Trainer:
             logger.info("Deleting older checkpoint [{}] due to args.save_total_limit".format(checkpoint))
             shutil.rmtree(checkpoint)
 
-    def evaluate(
-        self, eval_dataset: Optional[Dataset] = None, prediction_loss_only: Optional[bool] = None,
-    ) -> Dict[str, float]:
+    def evaluate(self, eval_dataset: Optional[Dataset] = None) -> Dict[str, float]:
         """
-        Run evaluation and return metrics.
+        Run evaluation and returns metrics.
 
         The calling script will be responsible for providing a method to compute metrics, as they are
-        task-dependent.
+        task-dependent (pass it to the init :obj:`compute_metrics` argument).
+
+        You can also subclass and override this method to inject custom behavior.
 
         Args:
-            eval_dataset: (Optional) Pass a dataset if you wish to override
-            the one on the instance.
+            eval_dataset (:obj:`Dataset`, `optional`):
+                Pass a dataset if you wish to override :obj:`self.eval_dataset`.
         Returns:
-            A dict containing:
-                - the eval loss
-                - the potential metrics computed from the predictions
+            A dictionary containing the evaluation loss and the potential metrics computed from the predictions.
         """
         eval_dataloader = self.get_eval_dataloader(eval_dataset)
 
-        output = self._prediction_loop(eval_dataloader, description="Evaluation")
+        output = self.prediction_loop(eval_dataloader, description="Evaluation")
 
-        self._log(output.metrics)
+        self.log(output.metrics)
 
-        if self.args.tpu_metrics_debug:
+        if self.args.tpu_metrics_debug or self.args.debug:
             # tpu-comment: Logging debug metrics for PyTorch/XLA (compile, execute times, ops, etc.)
             xm.master_print(met.metrics_report())
 
@@ -710,23 +837,41 @@ class Trainer:
 
     def predict(self, test_dataset: Dataset) -> PredictionOutput:
         """
-        Run prediction and return predictions and potential metrics.
+        Run prediction and returns predictions and potential metrics.
 
         Depending on the dataset and your use case, your test dataset may contain labels.
-        In that case, this method will also return metrics, like in evaluate().
+        In that case, this method will also return metrics, like in :obj:`evaluate()`.
+
+        Args:
+            test_dataset (:obj:`Dataset`):
+                Dataset to run the predictions on.
+        Returns:
+            `NamedTuple`:
+            predictions (:obj:`np.ndarray`):
+                The predictions on :obj:`test_dataset`.
+            label_ids (:obj:`np.ndarray`, `optional`):
+                The labels (if the dataset contained some).
+            metrics (:obj:`Dict[str, float]`, `optional`):
+                The potential dictionary of metrics (if the dataset contained labels).
         """
         test_dataloader = self.get_test_dataloader(test_dataset)
 
-        return self._prediction_loop(test_dataloader, description="Prediction")
+        return self.prediction_loop(test_dataloader, description="Prediction")
 
-    def _prediction_loop(
+    def prediction_loop(
         self, dataloader: DataLoader, description: str, prediction_loss_only: Optional[bool] = None
     ) -> PredictionOutput:
         """
-        Prediction/evaluation loop, shared by `evaluate()` and `predict()`.
+        Prediction/evaluation loop, shared by :obj:`Trainer.evaluate()` and :obj:`Trainer.predict()`.
 
         Works both with or without labels.
         """
+        if hasattr(self, "_prediction_loop"):
+            warnings.warn(
+                "The `_prediction_loop` method is deprecated and won't be called in a future version, define `prediction_loop` in your subclass.",
+                FutureWarning,
+            )
+            return self._prediction_loop(dataloader, description, prediction_loss_only=prediction_loss_only)
 
         prediction_loss_only = prediction_loss_only if prediction_loss_only is not None else self.prediction_loss_only
 
@@ -751,30 +896,21 @@ class Trainer:
         if is_torch_tpu_available():
             dataloader = pl.ParallelLoader(dataloader, [self.args.device]).per_device_loader(self.args.device)
 
+        if self.args.past_index >= 0:
+            self._past = None
+
         for inputs in tqdm(dataloader, desc=description):
-            has_labels = any(inputs.get(k) is not None for k in ["labels", "lm_labels", "masked_lm_labels"])
+            loss, logits, labels = self.prediction_step(model, inputs, prediction_loss_only)
+            if loss is not None:
+                eval_losses.append(loss)
+            if logits is not None:
+                preds = logits if preds is None else torch.cat((preds, logits), dim=0)
+            if labels is not None:
+                label_ids = labels if label_ids is None else torch.cat((label_ids, labels), dim=0)
 
-            for k, v in inputs.items():
-                inputs[k] = v.to(self.args.device)
-
-            with torch.no_grad():
-                outputs = model(**inputs)
-                if has_labels:
-                    step_eval_loss, logits = outputs[:2]
-                    eval_losses += [step_eval_loss.mean().item()]
-                else:
-                    logits = outputs[0]
-
-            if not prediction_loss_only:
-                if preds is None:
-                    preds = logits.detach()
-                else:
-                    preds = torch.cat((preds, logits.detach()), dim=0)
-                if inputs.get("labels") is not None:
-                    if label_ids is None:
-                        label_ids = inputs["labels"].detach()
-                    else:
-                        label_ids = torch.cat((label_ids, inputs["labels"].detach()), dim=0)
+        if self.args.past_index and hasattr(self, "_past"):
+            # Clean the state at the end of the evaluation loop
+            delattr(self, "_past")
 
         if self.args.local_rank != -1:
             # In distributed mode, concatenate all results from all nodes:
@@ -820,3 +956,49 @@ class Trainer:
         # truncate the dummy elements added by SequentialDistributedSampler
         output = concat[:num_total_examples]
         return output
+
+    def prediction_step(
+        self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]], prediction_loss_only: bool
+    ) -> Tuple[Optional[float], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Perform an evaluation step on :obj:`model` using obj:`inputs`.
+
+        Subclass and override to inject custom behavior.
+
+        Args:
+            model (:obj:`nn.Module`):
+                The model to evaluate.
+            inputs (:obj:`Dict[str, Union[torch.Tensor, Any]]`):
+                The inputs and targets of the model.
+
+                The dictionary will be unpacked before being fed to the model. Most models expect the targets under the
+                argument :obj:`labels`. Check your model's documentation for all accepted arguments.
+            prediction_loss_only (:obj:`bool`):
+                Whether or not to return the loss only.
+
+        Return:
+            Tuple[Optional[float], Optional[torch.Tensor], Optional[torch.Tensor]]:
+            A tuple with the loss, logits and labels (each being optional).
+        """
+        has_labels = any(inputs.get(k) is not None for k in ["labels", "lm_labels", "masked_lm_labels"])
+
+        inputs = self._prepare_inputs(inputs, model)
+
+        with torch.no_grad():
+            outputs = model(**inputs)
+            if has_labels:
+                loss, logits = outputs[:2]
+                loss = loss.mean().item()
+            else:
+                loss = None
+                logits = outputs[0]
+            if self.args.past_index >= 0:
+                self._past = outputs[self.args.past_index if has_labels else self.args.past_index - 1]
+
+        if prediction_loss_only:
+            return (loss, None, None)
+
+        labels = inputs.get("labels")
+        if labels is not None:
+            labels = labels.detach()
+        return (loss, logits.detach(), labels)

@@ -1,5 +1,5 @@
 ---
-language: english
+language: en
 datasets:
 - squad_v2
 ---
@@ -50,7 +50,7 @@ model = AutoModelForQuestionAnswering.from_pretrained("mrm8488/longformer-base-4
 
 text = "Huggingface has democratized NLP. Huge thanks to Huggingface for this."
 question = "What has Huggingface done ?"
-encoding = tokenizer.encode_plus(question, text, return_tensors="pt")
+encoding = tokenizer(question, text, return_tensors="pt")
 input_ids = encoding["input_ids"]
 
 # default is local attention everywhere
