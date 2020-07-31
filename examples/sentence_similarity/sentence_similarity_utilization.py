@@ -137,6 +137,7 @@ class SentenceExample:
     def convert_to_features(self, tokenizer):
         self.tokens = tokenizer.tokenize(self.text)
         encoded_dict = tokenizer.encode_plus(self.tokens,
+                                             truncation=True,
                                              max_length=32,
                                              pad_to_max_length=True,
                                              return_tensors="pt",

@@ -83,9 +83,10 @@ def load_and_cache_examples(args,
                             output_examples=False):
     # Load data features from cache or dataset file
     input_dir = "TEST_SS"
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir)
     cached_features_file = os.path.join(
-        # input_dir,
-        ".",
+        args.output_dir,
         "cached_{}_{}_{}".format(
             "dev" if evaluate else "train",
             list(filter(None, args.model_name_or_path.split("/"))).pop(),
@@ -93,7 +94,7 @@ def load_and_cache_examples(args,
         ),
     )
     # Init features and dataset from cache if it exists
-    if os.path.exists(cached_features_file) and not args.overwrite_cache:
+    if os.path.exists(cached_features_file) and args.read_cache:
         logger.info("Loading features from cached file %s",
                     cached_features_file)
         features_and_dataset = torch.load(cached_features_file)
@@ -560,9 +561,9 @@ def main():
         "Number of updates steps to accumulate before performing a backward/update pass.",
     )
     parser.add_argument(
-        "--overwrite_cache",
+        "--read_cache",
         action="store_true",
-        help="Overwrite the cached training and evaluation sets")
+        help="Read the cached training and evaluation sets")
     parser.add_argument("--warmup_steps",
                         default=0,
                         type=int,
